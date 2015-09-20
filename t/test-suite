@@ -1,0 +1,33 @@
+#!/usr/bin/ruby
+#
+#  This is a simple wrapper that will run the complete test-suite.
+#
+# Steve
+# --
+#
+
+#
+# Set up our include path
+#
+base = File.dirname(__FILE__)
+%w(bin lib .).each do |d|
+  $LOAD_PATH << File.expand_path(File.join(base, "../#{d}"))
+end
+
+require 'test/unit'
+require 'fileutils'
+
+
+
+#
+# Find where this file is located.
+#
+dir = File.dirname(__FILE__)
+
+#
+# Load each file in the same directory.
+#
+Dir.glob(File.join(dir, 't*.rb')).each do |test|
+  require test
+end
+

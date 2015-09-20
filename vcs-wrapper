@@ -1,0 +1,293 @@
+#!/usr/bin/ruby
+#
+# vcs-wrapper
+#
+# Allow per-user ACLs to be applied to repositories, via identification
+# setup in the ~/.ssh/authorized_keys file.
+#
+# Steve
+#
+
+
+#
+#  This shouldn't be required, but just in case.
+#
+if RUBY_VERSION =~ /1.9/
+  Encoding.default_external = Encoding::UTF_8
+  Encoding.default_internal = Encoding::UTF_8
+end
+
+require 'getoptlong'
+require 'singleton'
+
+
+#
+#  Read /etc/vcs-wrapper/vcs-wrapper.conf for user lookups
+#
+class ConfigFile
+  include Singleton
+
+  # Have we parsed our configuration-file?
+  attr_reader :parsed
+
+  # The permissions map from the configuration-file
+  attr_reader :permissions
+
+  # Constructor
+  def initialize
+    @parsed = false
+    @permissions = {}
+  end
+
+
+  # Load our configuration-file
+  def _load(file = '/etc/vcs-wrapper/vcs-wrapper.conf')
+    txt = File.open(file, 'r:UTF-8') { |handle| handle.readlines.collect }
+    _parse(txt)
+    @parsed = true
+  rescue Errno::ENOENT, Errno::EACCES => _ex
+    # NOP
+  end
+
+  # Parse the text from a configuration-file
+  def _parse(txt)
+    txt.each do |line|
+      if line =~ /^(.*)=(.*)$/
+
+        # Get the values from the line.
+        key = Regexp.last_match(1).strip!
+        val = Regexp.last_match(2).strip!
+
+        #  The value will be a comma-separated string.
+        #  Split it up
+        val.split(/,/).each do |element|
+          @permissions[key] ||= Array.new
+          @permissions[key].push(element.strip)
+        end
+      end
+    end
+  end
+
+  def permissions(user)
+    _load unless @parsed
+    @permissions[user]
+  end
+
+end
+
+
+#
+#  Class used to implement our access-control.
+#
+class VCSWrapper
+
+  # The command the user is trying to execute over SSH
+  attr_reader :cmd
+
+  # The configuration args from the SSH config.
+  attr_reader :args
+
+  def initialize(args, cmd)
+    @args = args
+    @cmd = cmd
+  end
+
+  #
+  # Send a message that the remote hg/git command will show to the user.
+  #
+  def send(txt)
+    $stderr.puts txt
+    $stderr.flush
+  end
+
+  #
+  # Log a message locally.
+  #
+  def log(txt)
+
+    # Get the remote IP
+    connection = ENV['SSH_CONNECTION'] || ''
+    ip = connection.split(/ /)[0] || ''
+
+    # Write to the logfile - prefix with date + IP.
+    File.open(File.expand_path('~/.vcs-wrapper.log'), 'a') do |f|
+      f.puts(Time.now.to_s + ' ' + ip + ' ' + txt)
+    end
+  end
+
+  #
+  # Get the repo the user is accessing.
+  #
+  def repo?
+    if @cmd =~ /^(git-upload-pack|git-receive-pack) ['"]([^'"]+)['"]$/
+      return Regexp.last_match(2).dup
+    elsif @cmd =~ /^hg -R ([^ ]+) serve --stdio$/
+      return Regexp.last_match(1).dup
+    end
+    nil
+  end
+
+
+  #
+  # Look at our command "user steve", or "repo XX,YY"
+  # to decided if we should be allowed to access the named repo.
+  #
+  def access?(repo)
+
+    #  No repo?  Then no access
+    return false unless repo
+
+    # Remove trailng slashes and get the basename of the repo
+    repo.gsub!(/\\$/, "")
+    repo = File.basename(repo)
+
+    # The local user on this system, and the local repository.
+    local_user = nil
+    local_repo = nil
+
+    #
+    # Remember that @args came from the ~/.ssh/authorized_keys setting
+    # and should read either:
+    #
+    #    user steve
+    #    user bob
+    # or
+    #    repo foo
+    #    repo foo,bar,baz
+    #    repo foo bar baz
+    #
+    if (@args.length == 2) && (@args[0] == 'user')
+      local_user = @args[1]
+    elsif (@args.length >= 2) && (@args[0] == 'repo')
+      # Skip the first element, join the rest with ",".
+      local_repo = @args.slice(1, @args.length).join( "," )
+    else
+      log("The authorized_key file should contain 'user XX' or 'repo XX'.")
+      false
+    end
+
+    # If neither setting were found then we can't access anything.
+    return false unless local_user || local_repo
+
+    #
+    # If the authorized_keys file-entry identified a user then we'll look
+    # to see which repositories that user has access to, and grant on
+    # that basis.
+    #
+    if local_user
+      # lookup permissions
+      config = ConfigFile.instance
+      perms = config.permissions(local_user.downcase)
+
+      # test the listed permissions.
+      perms.each do |permitted|
+        if (permitted == 'all') || (repo == permitted)
+          log("Allowing access to #{repo} from user #{local_user}")
+          return true
+        end
+      end
+    end
+
+    #
+    #  Otherwise if this account is for use in a single repository
+    # then we'll test to see if there is a match.
+    #
+    if local_repo
+      local_repo.split(/,/).each do |permitted|
+
+        if (permitted == 'all') || (repo == permitted)
+          log("User has access to #{local_repo}, allowing access of #{repo}")
+          return true
+        end
+      end
+    end
+
+    #
+    #  No allow?  Then deny.
+    #
+    false
+
+  end
+
+  #
+  #  Allow the action - Remapping relative repositories to those in
+  # the home directory, if required.  (Which it often is.  Sigh.)
+  #
+  def allow(repo)
+
+    # If the repo doesn't exist
+    if !File.exist?(repo)
+
+      # Rewrap
+      repo = ENV['HOME'] + '/' + repo
+
+      # Update the damn command we're going to execute - this is nasty
+      if @cmd =~ /(git-upload-pack|git-receive-pack) /
+        @cmd = "#{Regexp.last_match(1).dup} '#{repo}'"
+      elsif @cmd =~ /hg -R ([^ ]+) serve --stdio/
+        @cmd = "hg -R #{repo} serve --stdio"
+      else
+        log("Unable to remap repository to #{repo} - Not recognized: #{@cmd}")
+      end
+    end
+
+    # allow the clone/push
+    exec(@cmd)
+
+  end
+
+  #
+  #  Deny the cloning
+  #
+  def deny(*)
+    exit 1
+  end
+end
+
+
+
+
+if __FILE__ == $PROGRAM_NAME
+
+  #
+  #  TODO: Parse arguments, at least "--man|--help"
+  #
+
+
+  #
+  #  Ensure we're called via SSH.
+  #
+  if ( !ENV['SSH_ORIGINAL_COMMAND'] )
+    puts "This command is supposed to execute via SSH.  Aborting"
+    exit 1
+  end
+
+  #
+  #  Ensure we have a sane PATH setup.
+  #
+  ENV['PATH'] = '/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin'
+
+  #
+  #  Create the helper, and send a message to the remote host.
+  #
+  o = VCSWrapper.new(ARGV, ENV['SSH_ORIGINAL_COMMAND'])
+  o.send("Secure repository wrapper on #{`hostname`.strip!}")
+
+  # Which repo is the user attempting to access?
+  repo = o.repo?
+
+  # If we didn't get a repository something is wrong.  Abort.
+  if repo.nil?
+    o.send('Failed to find repository.  Aborting')
+    exit(1)
+  end
+
+  # Allow the access, if it should be permitted.
+  if o.access? repo
+    o.allow(repo)
+  else
+    o.deny(repo)
+  end
+
+  exit 0
+end
