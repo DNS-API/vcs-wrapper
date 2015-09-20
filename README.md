@@ -11,7 +11,7 @@ There are many existing wrappers like this, for different revision control syste
 
 Each works the same way, a single dedicated Unix account hosts the repositories, and clients connect using SSH.  The server knows which users is connecting due to a forced-command in the `~/.ssh/authorized_keys` file like so:
 
-   command="/path/to/wrapper login steve" ssh-rsa ..
+    command="/path/to/wrapper login steve" ssh-rsa ..
 
 This will identify the remote user as `steve`, at which point the wrapper-command can see if that user has permission for the named repository by consulting a configuration-file.
 
